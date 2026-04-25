@@ -9,6 +9,11 @@ import GetProgress, {
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 //const TrackData_Map = new Map();
 
+// Self-hosted fork: transparent 1x1 PNG, replaces the
+// images.spikerko.org placeholder image.
+const TRANSPARENT_PIXEL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgAAIAAAUAAeImBZsAAAAASUVORK5CYII=";
+
 /* const old_SpotifyPlayer = {
     IsPlaying: false,
     GetTrackPosition: GetProgress,
@@ -145,16 +150,14 @@ export const SpotifyPlayer = {
   },
   GetCover: (size: CoverSizes): string | undefined => {
     const item = Spicetify?.Player?.data?.item;
-    if (!item) return "https://images.spikerko.org/SongPlaceholderFull.png";
+    if (!item) return TRANSPARENT_PIXEL;
     // @ts-ignore aaa
     const covers = item.images ?? item.show?.images;
     if (covers?.length > 0) {
       const cover = covers.find((cover: any) => cover.label === size);
-      return (
-        cover?.url ?? "https://images.spikerko.org/SongPlaceholderFull.png"
-      );
+      return cover?.url ?? TRANSPARENT_PIXEL;
     }
-    return "https://images.spikerko.org/SongPlaceholderFull.png";
+    return TRANSPARENT_PIXEL;
   },
   GetCoverFrom: (
     size: CoverSizes,
@@ -163,12 +166,10 @@ export const SpotifyPlayer = {
     if (source) {
       if (source.length > 0) {
         const cover = source?.find((cover) => cover.label === size);
-        return (
-          cover?.url ?? "https://images.spikerko.org/SongPlaceholderFull.png"
-        );
+        return cover?.url ?? TRANSPARENT_PIXEL;
       }
     }
-    return "https://images.spikerko.org/SongPlaceholderFull.png";
+    return TRANSPARENT_PIXEL;
   },
   GetName: (): string | undefined => {
     return Spicetify?.Player?.data?.item?.name;

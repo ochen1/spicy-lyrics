@@ -1,10 +1,7 @@
 import { DeepFreeze } from "../../utils/Addons.ts";
 
-const Fonts = DeepFreeze({
-  Lyrics: () => LoadFont("https://fonts.spikerko.org/spicy-lyrics/source.css"),
-  Vazirmatn: () => LoadFont("https://fonts.spikerko.org/Vazirmatn/source.css"),
-  NotoSansGeorgian: () => LoadFont("https://fonts.spikerko.org/NotoSansGeorgian/source.css"),
-});
+// Self-hosted fork: external font CSS is not loaded. Use system fonts.
+const Fonts = DeepFreeze({} as Record<string, () => void>);
 
 export default function LoadFonts() {
   // Iterate over the functions in Fonts and execute each one

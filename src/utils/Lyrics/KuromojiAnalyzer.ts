@@ -16,7 +16,7 @@ export const init = (): Promise<void> => {
       await new Promise((r) => setTimeout(r, 50));
     }
     (window as any).kuromoji.builder({
-      dicPath: "https://kuromoji.pkgs.spikerko.org",
+      dicPath: "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict",
     }).build((error: any, analyzer: any) => {
       if (error) {
         return reject(error);

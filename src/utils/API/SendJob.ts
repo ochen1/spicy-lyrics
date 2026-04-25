@@ -68,10 +68,8 @@ async function SendJob(
   headers: Record<string, string> = {}
 ): Promise<JobResultGetter> {
   const primary = Defaults.lyrics.api.url;
-  const fallbacks = [
-    "https://coregateway.spicylyrics.org",
-    "https://lcgateway.spikerko.org",
-  ];
+  // Self-hosted fork: do not probe author-controlled fallback gateways.
+  const fallbacks: string[] = [];
 
   // Try first host
   let API_BASE = await getActiveApiBaseUrl(primary, fallbacks);

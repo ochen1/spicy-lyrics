@@ -12,23 +12,7 @@ const UpdateDialog: React.FC<UpdateDialogProps> = ({ fromVersion, spicyLyricsVer
       <div className="card version">
         Version: {fromVersion ? `${fromVersion} → ` : ""}{spicyLyricsVersion || "Unknown"}
       </div>
-      <button
-        className="card btn btn-release"
-        onClick={() =>
-          window.open(
-            `https://github.com/Spikerko/spicy-lyrics/releases/tag/${spicyLyricsVersion}`,
-            "_blank"
-          )
-        }
-      >
-        Release Notes →
-      </button>
-      <button
-        className="card btn btn-discord"
-        onClick={() => window.open("https://discord.com/invite/uqgXU5wh8j", "_blank")}
-      >
-        <p>Join our Discord Server! →</p>
-      </button>
+      {/* Self-hosted fork: external links removed. */}
     </div>
   );
 };

@@ -336,10 +336,9 @@ function ProfileDisplaySafe({ userId, hasProfileBanner }: ProfileDisplayProps) {
   );
 }
 
-// Export wrapped with error boundary for safety
-const ProfileDisplayExport = (props: ProfileDisplayProps) => (
-  <ErrorBoundary>
-    <ProfileDisplaySafe {...props} />
-  </ErrorBoundary>
-);
+// Self-hosted fork: TTML profile display is disabled to avoid querying
+// author-controlled profile data and opening spicylyrics.org. The original
+// implementation above is kept intact (soft-stub) but never rendered.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const ProfileDisplayExport = (_props: ProfileDisplayProps) => null;
 export default ProfileDisplayExport;

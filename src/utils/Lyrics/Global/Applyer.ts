@@ -141,16 +141,7 @@ export default async function ApplyLyrics(lyricsContent: [object | string, numbe
 
     currentNoticeElement.innerHTML = `
       <p class="notice-descriptor">${noticeContent.trim()}</p>
-      <p class="notice-footer">Need more help? Join our <a>Discord</a>.</p>
     `;
-
-    // Add click handler to log when the Discord link is clicked
-    const discordLink = currentNoticeElement.querySelector("a");
-    if (discordLink) {
-      discordLink.addEventListener("click", () => {
-        window.open("https://discord.com/invite/uqgXU5wh8j", "_blank");
-      }, { signal: currentAbortController.signal });
-    }
 
     EmitApply("None", null)
     SetWaitingForHeight(false);

@@ -1,11 +1,12 @@
 # Spicy Lyrics — self-hosted fork
 
 Personal fork of [Spikerko/spicy-lyrics](https://github.com/Spikerko/spicy-lyrics),
-pinned to upstream commit [`594a325`](https://github.com/Spikerko/spicy-lyrics/commit/594a325)
-(2026-04-07). The upstream extension installs a 92-byte CDN stub that re-fetches
-arbitrary code from `cdn.jsdelivr.net/gh/Spikerko/spicy-lyrics@main/...` on every
-Spotify launch; this fork builds the extension from `src/` and removes the
-remote-code-loading channels.
+synced to upstream **v6.3.12**, commit
+[`4576d02`](https://github.com/Spikerko/spicy-lyrics/commit/4576d02).
+Builds the extension locally from `src/` without the upstream CDN loader.
+
+The update brings current Spotify token support, the new packed lyrics format,
+request deadlines, service backoff, and stale-track response protection.
 
 ## What changed vs. upstream
 
@@ -18,6 +19,7 @@ remote-code-loading channels.
   immutable npm releases.
 - **Side-service phone-home channels removed**, all soft-stubbed in source so
   the diff against upstream is small:
+  - background session creation, refresh, and telemetry pings
   - update poller + version-check (`api.spicylyrics.org/query?ext_version`)
   - fallback host probing (`coregateway.spicylyrics.org`, `lcgateway.spikerko.org`)
   - external font CSS (`fonts.spikerko.org`)
@@ -34,7 +36,8 @@ After install, the only hosts the extension contacts are:
 | Host | Why |
 |---|---|
 | `api.spicylyrics.org` | Lyrics data |
-| `spclient.wg.spotify.com` | Spotify's own audio-analysis API |
+| `spclient.wg.spotify.com` | Spotify metadata and audio analysis |
+| `api-partner.spotify.com` | Spotify track metadata for the local lyrics manager |
 | `i.scdn.co` | Spotify's own cover-art CDN |
 | `cdn.jsdelivr.net` | Romanization libs + kuromoji dictionary, pinned by exact npm version |
 
@@ -50,11 +53,28 @@ Requires [Bun](https://bun.com) and [Spicetify](https://spicetify.app).
 bun install
 bun run build
 spicetify config extensions spicy-lyrics.js
-spicetify apply
+bun run apply
 ```
 
 `spicetify-creator` auto-copies the built bundle into your Spicetify Extensions
 directory during `bun run build`.
+
+`bun run apply` applies Spicetify without restarting Spotify, then patches the
+installed **Spicetify 2.44.0** wrapper for **Spotify 1.2.97**. Reload/restart
+Spotify afterward. Plain `spicetify apply` overwrites this compatibility patch.
+
+The wrapper otherwise fails while discovering lazy modules with missing
+imports, never signals readiness to extensions, and leaves `Player.origin`
+unbound. The patch skips unavailable modules, waits for the platform before
+signaling readiness, flushes the module callback queue, and binds the player
+from `Platform.PlayerAPI`. It is idempotent, preserves an adjacent `.spicy-backup`,
+and refuses unrecognized wrappers instead of partially modifying them.
+Review/remove this workaround when upgrading Spicetify beyond 2.44.0.
+
+On first launch after upgrading from v5, use the upstream **Migrate Settings**
+button to retain existing settings. This installation has already been migrated.
+
+Validation: `bun test`, `bun run lint`, and `bun run build`.
 
 To remove:
 

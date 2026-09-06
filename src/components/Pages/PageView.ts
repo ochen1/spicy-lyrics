@@ -1,7 +1,7 @@
-import fetchLyrics from "../../utils/Lyrics/fetchLyrics.ts";
-import storage from "../../utils/storage.ts";
+import fetchLyrics, { ShowQueueLoader } from "../../utils/Lyrics/fetchLyrics.ts";
+import { LyricsQueueRetry } from "../../utils/Lyrics/LyricsQueueRetry.ts";
+import { $forceCompactMode } from "../../utils/uiState.ts";
 import "../../css/Loaders/DotLoader.css";
-import Whentil from "@spikerko/tools/Whentil";
 import { DestroyAllLyricsContainers } from "../../utils/Lyrics/Applyer/CreateLyricsContainer.ts";
 import ApplyLyrics, {
   cleanupApplyLyricsAbortController,
@@ -19,7 +19,17 @@ import {
 } from "../../utils/Scrolling/ScrollToActiveLine.ts";
 import { ScrollSimplebar } from "../../utils/Scrolling/Simplebar/ScrollSimplebar.ts";
 import ApplyDynamicBackground, { KawarpMap } from "../DynamicBG/dynamicBackground.ts";
-import Defaults from "../Global/Defaults.ts";
+import {
+  $currentLyricsData,
+  $lineHoverBackground,
+  $lyricsContainerExists,
+  $minimalLyricsMode,
+  $showVolumeSlider,
+  $simpleLyricsMode,
+  $skipSpicyFont,
+  $ttmlMakerMode,
+  $viewControlsPosition,
+} from "../../utils/stores.ts";
 import Global from "../Global/Global.ts";
 import Session from "../Global/Session.ts";
 import { SpotifyPlayer } from "../Global/SpotifyPlayer.ts";
@@ -41,15 +51,18 @@ import {
   ToggleNowBar,
   OpenNowBar,
 } from "../Utils/NowBar.ts";
-import {
-  CloseSidebarLyrics,
-  OpenSidebarLyrics,
-  isSpicySidebarMode,
-  cleanupSidebarLyricsObservers
-} from "../Utils/SidebarLyrics.ts";
 import TransferElement from "../Utils/TransferElement.ts";
 import { IsPIP, _IsPIP_after, ClosePopupLyrics } from "../Utils/PopupLyrics.ts";
+import { NPVCardOwnsPage, DeRenderNPVCard } from "../Utils/NPVLyrics.ts";
 import { CleanUpIsByCommunity } from "../../utils/Lyrics/Applyer/Credits/ApplyIsByCommunity.tsx";
+import { OpenLyricsDBPanel } from "../../utils/openLyricsDBPanel.tsx";
+import { openSettingsPanel } from "../../utils/settings.ts";
+import Logger from "../../utils/Logger.ts";
+import { ApplyExperimentClasses, onExperimentChange } from "../../utils/experiments.ts";
+import { triggerRemeasureLV } from "../../utils/Lyrics/LyricsVirtualizer.ts";
+
+const pageLogger = new Logger("Page View");
+const controlsLogger = new Logger("View Controls");
 
 interface TippyInstance {
   destroy: () => void;
@@ -62,14 +75,16 @@ export const Tooltips: {
   FullscreenToggle: TippyInstance | null;
   CinemaView: TippyInstance | null;
   NowBarSideToggle: TippyInstance | null;
-  DevTools: TippyInstance | null;
+  LyricsManager: TippyInstance | null;
+  Settings: TippyInstance | null;
 } = {
   Close: null,
   NowBarToggle: null,
   FullscreenToggle: null,
   CinemaView: null,
   NowBarSideToggle: null,
-  DevTools: null,
+  LyricsManager: null,
+  Settings: null,
 };
 
 const PageView = {
@@ -100,31 +115,38 @@ export const GetPageRoot = () =>
 
 let PageResizeListener: ResizeObserver | null = null;
 export let PageContainer: HTMLElement | null = null;
+export let IsCardMode = false;
 
 async function OpenPage(
   AppendTo: HTMLElement | undefined = undefined,
-  isSidebarMode: boolean = false
+  options?: { cardMode?: boolean }
 ) {
 
   if (_IsPIP_after) {
-    ClosePopupLyrics();
+    await ClosePopupLyrics();
     // After closing, open again with the same arguments
-    return OpenPage(AppendTo, isSidebarMode);
+    return OpenPage(AppendTo, options);
+  }
+
+  if (!options?.cardMode && NPVCardOwnsPage()) {
+    // The NPV card holds the global page; hand it over to the real requester.
+    await DeRenderNPVCard();
+    return OpenPage(AppendTo, options);
   }
 
   if (PageView.IsOpened) return;
+
+  IsCardMode = !!options?.cardMode;
   /* if (!HoverMode) {
         PageView.IsTippyCapable = false;
     } */
   const elem = document.createElement("div");
   elem.id = "SpicyLyricsPage";
 
-  if (Defaults.LyricsRenderer === "Spicy") {
-    elem.classList.add("SpicyRenderer");
-  }
+  elem.classList.add("SpicyRenderer");
 
-  if (isSidebarMode) {
-    elem.classList.add("SidebarMode");
+  if (IsCardMode) {
+    elem.classList.add("CardMode");
   }
 
   /* if (HoverMode) {
@@ -133,18 +155,7 @@ async function OpenPage(
   //const extractedColors = ((await Spicetify.colorExtractor(SpotifyPlayer.GetUri() ?? "spotify:track:31CsSZ9KlQmEu0JvWSkM3j")) as any) ?? { VIBRANT_NON_ALARMING: "#999999" };
   //const vibrantNonAlarmingColor = extractedColors?.VIBRANT_NON_ALARMING ?? "#999999";
   elem.innerHTML = `
-        <div class="NotificationContainer">
-            <div class="NotificationIcon"></div>
-            <div class="NotificationText">
-                <div class="NotificationTitle"></div>
-                <div class="NotificationDescription"></div>
-            </div>
-            <div class="NotificationCloseButton">X</div>
-        </div>
-        <div class="SpicyLoader">
-            <div id="DotLoader"></div>
-        </div>
-        <div class="ContentBox WaitingForHeight">
+        <div class="ContentBox">
             <div class="NowBar">
                 <div class="CenteredView">
                     <div class="Header">
@@ -176,21 +187,9 @@ async function OpenPage(
         </div>
     `;
 
-  const waitingForHeightEvent = Global.Event.listen(
-    `policy:waiting-for-height`,
-    (value: boolean) => {
-      if (value === false) {
-        elem
-          .querySelector<HTMLElement>(".ContentBox")
-          ?.classList.remove("WaitingForHeight");
-        Global.Event.unListen(waitingForHeightEvent);
-      }
-    }
-  );
-
-  if (Defaults.ViewControlsPosition === "Top") {
+  if ($viewControlsPosition.get() === "Top") {
     elem.classList.add("ViewControlsPosition_Top")
-  } else if (Defaults.ViewControlsPosition === "Bottom") {
+  } else if ($viewControlsPosition.get() === "Bottom") {
     elem.classList.add("ViewControlsPosition_Bottom")
   }
 
@@ -218,19 +217,44 @@ async function OpenPage(
             </div>
         </div>
     */
+
+  
   PageContainer = elem;
 
-  const SkipSpicyFont = storage.get("skip-spicy-font");
-  if (SkipSpicyFont !== "true") {
+  if (!$skipSpicyFont.get()) {
     elem.classList.add("UseSpicyFont");
   }
 
-  if (Defaults.SimpleLyricsMode) {
+  if ($simpleLyricsMode.get()) {
     elem.classList.add("SimpleLyricsMode");
   }
 
-  if (Defaults.MinimalLyricsMode) {
+  if ($minimalLyricsMode.get()) {
     elem.classList.add("MinimalLyricsMode");
+  }
+
+  if (!$lineHoverBackground.get()) {
+    elem.classList.add("NoLineHoverBackground");
+  }
+
+  // Gates the raised .PlaybackControls / tightened .Heart offsets that make room for
+  // the volume band — without it, turning the setting off would leave a gap.
+  if ($showVolumeSlider.get()) {
+    elem.classList.add("ShowVolumeSlider");
+  }
+
+  ApplyExperimentClasses(elem);
+
+  const contentBox = elem.querySelector<HTMLElement>(
+    ".ContentBox"
+  );
+  // Card mode stays transparent — the NPV's own dynamic background shows through.
+  if (contentBox && !IsCardMode) {
+    try {
+      ApplyDynamicBackground(contentBox, "lpagebg");
+    } catch (err) {
+      pageLogger.error("Error applying dynamic background", err);
+    }
   }
 
   if (AppendTo !== undefined) {
@@ -239,39 +263,41 @@ async function OpenPage(
     GetPageRoot()?.appendChild(elem);
   }
 
-  const contentBox = elem.querySelector<HTMLElement>(
-    ".ContentBox"
-  );
-  if (contentBox) {
-    try {
-      ApplyDynamicBackground(contentBox, "lpagebg");
-    } catch (err) {
-      console.error("Error applying dynamic background:", err);
-    }
-  }
-
   addLinesEvListener();
 
   {
     const currentUri = Spicetify?.Player?.data?.item?.uri;
     if (currentUri) {
+      // If a 503 retry loop is already running for this track, re-show the
+      // queue loader right away so reopening the page / swapping views restores
+      // the queued state with no flash of empty content.
+      if (LyricsQueueRetry.IsRetryingFor(currentUri)) {
+        ShowQueueLoader();
+      }
       fetchLyrics(currentUri).then(ApplyLyrics);
     }
   }
 
-  Session_OpenNowBar();
+  if (!IsCardMode) {
+    Session_OpenNowBar();
 
-  /* const ArtworkButton = document.querySelector<HTMLElement>("#SpicyLyricsPage .ContentBox .NowBar .Header .Artwork");
+    /* const ArtworkButton = document.querySelector<HTMLElement>("#SpicyLyricsPage .ContentBox .NowBar .Header .Artwork");
 
-    ArtworkButton.addEventListener("click", () => {
-        NowBar_SwapSides();
-    }) */
+      ArtworkButton.addEventListener("click", () => {
+          NowBar_SwapSides();
+      }) */
 
-  Session_NowBar_SetSide();
+    Session_NowBar_SetSide();
 
-  AppendViewControls();
+    AppendViewControls();
 
-  DisableCompactMode();
+    DisableCompactMode();
+  } else if (IsCompactMode()) {
+    // A previous PiP/fullscreen open left the module flag set; the card page
+    // never enables compact mode, and a stale flag makes ScrollToActiveLine
+    // pin the active line to the top instead of centering it.
+    DisableCompactMode();
+  }
 
   PageResizeListener = new ResizeObserver(() => {
     if (!Fullscreen.IsOpen || !Fullscreen.CinemaViewOpen) return;
@@ -291,7 +317,7 @@ async function OpenPage(
 
   // UpdateSongMoreInfo()
 
-  Defaults.LyricsContainerExists = true;
+  $lyricsContainerExists.set(true);
   PageView.IsOpened = true;
 
   if (IsPIP) {
@@ -308,6 +334,8 @@ async function OpenPage(
   } else {
     elem?.classList.remove("episode-content-type");
   }
+
+  Global.Event.evoke("page:open", { cardMode: IsCardMode });
 }
 
 /* Global.Event.listen("playback:songchange", () => {
@@ -333,16 +361,13 @@ export function Compactify(Element: HTMLElement | undefined = undefined) {
   }
 }
 
-function DestroyPage() {
+async function DestroyPage() {
   if (!PageView.IsOpened) return;
+  pageLogger.debug("Destroying page");
 
   cleanupApplyLyricsAbortController();
 
-  if (isSpicySidebarMode) {
-    cleanupSidebarLyricsObservers();
-  }
-
-  if (Fullscreen.IsOpen) Fullscreen.Close();
+  if (Fullscreen.IsOpen) await Fullscreen.Close();
   if (!PageContainer) return;
 
   KawarpMap.get("lpagebg")?.dispose();
@@ -351,7 +376,7 @@ function DestroyPage() {
   CleanupScrollEvents();
   PageResizeListener?.disconnect(); // Disconnect the observer
   PageView.IsOpened = false;
-  Defaults.LyricsContainerExists = false;
+  $lyricsContainerExists.set(false);
   DestroyAllLyricsContainers();
   CleanUpIsByCommunity();
 
@@ -368,6 +393,7 @@ function DestroyPage() {
     a?.destroy();
   });
   ScrollSimplebar?.unMount();
+  IsCardMode = false;
   Global.Event.evoke("page:destroy", null);
   PageView.IsTippyCapable = true;
   PageContainer = null;
@@ -390,10 +416,15 @@ Global.Event.listen("lyrics:apply", ({ Type }: { Type: string }) => {
     //QueueForceScroll(); // Queue a force scroll instead of directly calling with true
     LyricsApplied = true;
   }
+
+  setTimeout(() => triggerRemeasureLV(), 1000);
+  setTimeout(() => triggerRemeasureLV(), 1500);
 });
 
 function AppendViewControls(ReAppend: boolean = false) {
+  if (IsCardMode) return;
   if (!PageContainer) return;
+  controlsLogger.debug("Append view controls");
   const elem = PageContainer.querySelector<HTMLElement>(
     ".ContentBox .ViewControls"
   );
@@ -410,9 +441,8 @@ function AppendViewControls(ReAppend: boolean = false) {
 
   if (ReAppend) elem.innerHTML = "";
   const isNoLyrics =
-    storage.get("currentLyricsData")?.toString() ===
-    `NO_LYRICS:${SpotifyPlayer.GetId()}`;
-  const isDevMode = storage.get("devMode") === "true";
+    $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetUri()}`;
+  const isTTMLMakerMode = $ttmlMakerMode.get();
   elem.innerHTML = `
         ${
           Fullscreen.IsOpen || Fullscreen.CinemaViewOpen
@@ -428,26 +458,22 @@ function AppendViewControls(ReAppend: boolean = false) {
               }</button>`
             : ""
         }
-        ${
-          Defaults.LyricsRenderer === "Spicy"
-            ? `<button id="RomanizationToggle" class="ViewControl">${
-                isRomanized
-                  ? Icons.DisableRomanization
-                  : Icons.EnableRomanization
-              }</button>`
-            : ""
-        }
+        <button id="RomanizationToggle" class="ViewControl">
+          ${
+            isRomanized
+              ? Icons.DisableRomanization
+              : Icons.EnableRomanization
+          }
+        </button>
         ${
           !Fullscreen.IsOpen &&
-          !Fullscreen.CinemaViewOpen &&
-          !isSpicySidebarMode
+          !Fullscreen.CinemaViewOpen
             ? IsPIP ? "" : `<button id="NowBarToggle" class="ViewControl">${Icons.NowBar}</button>`
             : ""
         }
         ${
-          NowBarObj.Open &&
-          !isSpicySidebarMode
-            ? IsPIP ? "" : `<button id="NowBarSideToggle" class="ViewControl">${Icons.Fullscreen}</button>`
+          NowBarObj.Open
+            ? IsPIP ? "" : `<button id="NowBarSideToggle" class="ViewControl">${Icons.NowBarSideSwap}</button>`
             : ""
         }
         ${
@@ -460,19 +486,11 @@ function AppendViewControls(ReAppend: boolean = false) {
             : ""
         }
         ${
-          !Fullscreen.IsOpen && !Fullscreen.CinemaViewOpen
-            ? IsPIP ? "" : `<button id="SidebarModeToggle" class="ViewControl">${
-                isSpicySidebarMode
-                  ? Icons["panel-right-open"]
-                  : Icons["panel-right-close"]
-              }</button>`
+          isTTMLMakerMode
+            ? `<button id="LyricsManager" class="ViewControl">${Icons.LyricsManager}</button>`
             : ""
         }
-        ${
-          isDevMode
-            ? `<button id="DevTools" class="ViewControl">${Icons.DevTools}</button>`
-            : ""
-        }
+        ${IsPIP ? "" : `<button id="SettingsToggle" class="ViewControl">${Icons.Settings}</button>`}
         <button id="Close" class="ViewControl">${Icons.Close}</button>
     `;
 
@@ -518,27 +536,21 @@ function AppendViewControls(ReAppend: boolean = false) {
             content: `Close Page`,
           });
         }
-        closeButton.addEventListener("click", () => {
+        closeButton.addEventListener("click", async () => {
           if (IsPIP) {
-            ClosePopupLyrics();
+            await ClosePopupLyrics();
             globalThis.focus();
             return;
           }
 
           if (Fullscreen.IsOpen) {
-            // If in any fullscreen mode, close it first
-            Fullscreen.Close();
-          }
-
-          if (isSpicySidebarMode) {
-            CloseSidebarLyrics();
-            return;
+            await Fullscreen.Close();
           }
 
           Session.GoBack();
         });
       } catch (err) {
-        console.warn("Failed to setup Close tooltip:", err);
+        controlsLogger.warn("Failed to setup Close tooltip", err);
       }
     }
 
@@ -560,11 +572,11 @@ function AppendViewControls(ReAppend: boolean = false) {
             if (IsCompactMode()) {
               SpicyLyricsPage?.classList.remove("ForcedCompactMode");
               DisableCompactMode();
-              storage.set("ForceCompactMode", "false");
+              $forceCompactMode.set(false);
             } else {
               SpicyLyricsPage?.classList.add("ForcedCompactMode");
               EnableCompactMode();
-              storage.set("ForceCompactMode", "true");
+              $forceCompactMode.set(true);
             }
 
             setTimeout(() => {
@@ -573,7 +585,7 @@ function AppendViewControls(ReAppend: boolean = false) {
           }
         });
       } catch (err) {
-        console.warn("Failed to setup Close tooltip:", err);
+        controlsLogger.warn("Failed to setup Compact Mode tooltip", err);
       }
     }
 
@@ -606,7 +618,7 @@ function AppendViewControls(ReAppend: boolean = false) {
           }, 45);
         });
       } catch (err) {
-        console.warn("Failed to setup Close tooltip:", err);
+        controlsLogger.warn("Failed to setup Romanization tooltip", err);
       }
     }
 
@@ -622,53 +634,10 @@ function AppendViewControls(ReAppend: boolean = false) {
           }
           nowBarButton.addEventListener("click", () => ToggleNowBar());
         } catch (err) {
-          console.warn("Failed to setup NowBar tooltip:", err);
+          controlsLogger.warn("Failed to setup NowBar tooltip", err);
         }
       }
 
-      const sidebarModeToggle = elem.querySelector("#SidebarModeToggle");
-      if (sidebarModeToggle) {
-        try {
-          if (!isPip) {
-            Tooltips.NowBarToggle = Spicetify.Tippy(sidebarModeToggle, {
-              ...Spicetify.TippyProps,
-              content: isSpicySidebarMode
-                ? `Switch to normal mode`
-                : `Switch to Sidebar Mode`,
-            });
-          }
-          sidebarModeToggle.addEventListener("click", () => {
-            (sidebarModeToggle as HTMLElement).style.pointerEvents = "none";
-            (sidebarModeToggle as HTMLElement).style.cursor = "not-allowed";
-            const page = PageContainer;
-            if (isSpicySidebarMode) {
-              page?.classList.add("SidebarTransition__Closing");
-              setTimeout(() => {
-                CloseSidebarLyrics();
-                Whentil.When(
-                  () => !isSpicySidebarMode,
-                  () => {
-                    Session.Navigate({ pathname: "/SpicyLyrics" });
-                  }
-                );
-              }, 495);
-            } else {
-              page?.classList.add("SidebarTransition__Opening");
-              setTimeout(() => {
-                Session.GoBack();
-                Whentil.When(
-                  () => !PageView.IsOpened,
-                  () => {
-                    OpenSidebarLyrics();
-                  }
-                );
-              }, 350);
-            }
-          });
-        } catch (err) {
-          console.warn("Failed to setup sidebarModeToggle tooltip:", err);
-        }
-      }
     }
 
     const fullscreenBtn = elem.querySelector("#FullscreenToggle");
@@ -696,7 +665,7 @@ function AppendViewControls(ReAppend: boolean = false) {
           setTimeout(Compactify, 250);
         });
       } catch (err) {
-        console.warn("Failed to setup Fullscreen tooltip:", err);
+        controlsLogger.warn("Failed to setup Fullscreen tooltip", err);
       }
     }
 
@@ -710,28 +679,10 @@ function AppendViewControls(ReAppend: boolean = false) {
           });
         }
         cinemaViewBtn.addEventListener("click", async () => {
-          if (isSpicySidebarMode) {
-            CloseSidebarLyrics();
-            Whentil.When(
-              () => !isSpicySidebarMode,
-              () => {
-                Session.Navigate({ pathname: "/SpicyLyrics" });
-                Whentil.When(
-                  () => !!PageContainer,
-                  () => {
-                    setTimeout(() => {
-                      Fullscreen.Open(true);
-                    }, 100);
-                  }
-                );
-              }
-            );
-          } else {
-            Fullscreen.Open(true);
-          }
+          Fullscreen.Open(true);
         });
       } catch (err) {
-        console.warn("Failed to setup CinemaView tooltip:", err);
+        controlsLogger.warn("Failed to setup Cinema View tooltip", err);
       }
     }
 
@@ -750,201 +701,100 @@ function AppendViewControls(ReAppend: boolean = false) {
         }
         nowBarSideToggleBtn.addEventListener("click", () => NowBar_SwapSides());
       } catch (err) {
-        console.warn("Failed to setup NowBarSideToggle tooltip:", err);
+        controlsLogger.warn("Failed to setup NowBar Side Toggle tooltip", err);
       }
     }
 
-    const devToolsButton = elem.querySelector("#DevTools");
-    if (devToolsButton && isDevMode) {
+    const settingsButton = elem.querySelector("#SettingsToggle");
+    if (settingsButton && !isPip) {
+      try {
+        Tooltips.Settings = Spicetify.Tippy(settingsButton, {
+          ...Spicetify.TippyProps,
+          content: `Spicy Lyrics Settings`,
+        });
+        settingsButton.addEventListener("click", () => {
+          openSettingsPanel();
+        });
+      } catch (err) {
+        controlsLogger.warn("Failed to setup Settings tooltip", err);
+      }
+    }
+
+    const lyricsManagerButton = elem.querySelector("#LyricsManager");
+    if (lyricsManagerButton && isTTMLMakerMode) {
       try {
         if (!isPip) {
-          Tooltips.DevTools = Spicetify.Tippy(devToolsButton, {
+          Tooltips.LyricsManager = Spicetify.Tippy(lyricsManagerButton, {
             ...Spicetify.TippyProps,
-            content: `DevTools`,
+            content: `Lyrics Manager`,
           });
         }
-        devToolsButton.addEventListener("click", () => {
+        lyricsManagerButton.addEventListener("click", () => {
           if (IsPIP) {
             globalThis.focus();
           }
-
-          Spicetify.PopupModal.display({
-            title: "Spicy Lyrics DevTools",
-            isLarge: true,
-            content: `
-                            <div class="SpicyLyricsDevToolsContainer">
-                                <div class="Setting">
-                                    <div class="SettingName"><span>Load TTML (for the current song)</span></div>
-                                    <div class="SettingValue">
-                                        <button onclick="window._spicy_lyrics.execute('upload-ttml')">Load TTML</button>
-                                    </div>
-                                </div>
-                                <div class="Setting">
-                                    <div class="SettingName"><span>Reset TTML (for the current song)</span></div>
-                                    <div class="SettingValue">
-                                        <button onclick="window._spicy_lyrics.execute('reset-ttml')">Reset TTML</button>
-                                    </div>
-                                </div>
-                            </div>
-                        `,
-          });
+          
+          OpenLyricsDBPanel();
         });
       } catch (err) {
-        console.warn("Failed to setup DevTools tooltip:", err);
+        controlsLogger.warn("Failed to setup Lyrics Manager tooltip", err);
       }
     }
   }
 }
 
-interface SpicyLyricsNotificationReturnObject {
-  cleanup: () => void;
-  close: () => void;
-  open: () => void;
-}
+// --- Reactive setting subscriptions ---
 
-const showTopbarNotifications =
-  storage.get("show_topbar_notifications") === "true";
+$simpleLyricsMode.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("SimpleLyricsMode", v);
+  const uri = SpotifyPlayer.GetUri();
+  $currentLyricsData.set("");
+  if (uri) fetchLyrics(uri).then(ApplyLyrics);
+});
 
-export function SpicyLyrics_Notification({
-  icon,
-  metadata: { title, description },
-  type,
-  closeBtn,
-}: {
-  icon: string;
-  metadata: {
-    title: string;
-    description: string;
-  };
-  type?: "Danger" | "Information" | "Success" | "Warning";
-  closeBtn?: boolean;
-}): SpicyLyricsNotificationReturnObject {
-  const nonFunctionalReturnObject = {
-    cleanup: () => {},
-    close: () => {},
-    open: () => {},
-  };
-  if (!showTopbarNotifications) return nonFunctionalReturnObject;
-  if (!PageView.IsOpened) return nonFunctionalReturnObject;
-  const NotificationContainer = PageContainer?.querySelector(
-    ".NotificationContainer"
-  );
-  if (!NotificationContainer) return nonFunctionalReturnObject;
-  const Title = NotificationContainer.querySelector(
-    ".NotificationText .NotificationTitle"
-  );
-  const Description = NotificationContainer.querySelector(
-    ".NotificationText .NotificationDescription"
-  );
-  const Icon = NotificationContainer.querySelector(".NotificationIcon");
-  const CloseButton = NotificationContainer.querySelector(
-    ".NotificationCloseButton"
-  );
+$minimalLyricsMode.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("MinimalLyricsMode", v);
+  const uri = SpotifyPlayer.GetUri();
+  $currentLyricsData.set("");
+  if (uri) fetchLyrics(uri).then(ApplyLyrics);
+});
 
-  if (Title && title) {
-    Title.textContent = title;
-  }
-  if (Description && description) {
-    Description.textContent = description;
-  }
-  if (Icon && icon) {
-    Icon.innerHTML = icon;
-  }
+// Purely a CSS toggle — no need to re-render the lyrics like the modes above do.
+$lineHoverBackground.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("NoLineHoverBackground", !v);
+});
 
-  const closeBtnHandler = () => {
-    NotificationContainer.classList.remove("Visible");
-    if (Title) {
-      Title.textContent = "";
-    }
-    if (Description) {
-      Description.textContent = "";
-    }
-    if (Icon) {
-      Icon.innerHTML = "";
-    }
-    if (CloseButton) {
-      CloseButton.classList.remove("Disabled");
-    }
-  };
+$skipSpicyFont.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("UseSpicyFont", !v);
+});
 
-  NotificationContainer.classList.add(type ?? "Information");
+// Purely a CSS gate — NowBar.ts handles rebuilding the band itself.
+$showVolumeSlider.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("ShowVolumeSlider", v);
+});
 
-  const closeBtnA = closeBtn ?? true;
+// Experiments own their CSS hook here; NowBar.ts handles the rebuild for the ones
+// that need one. Adding an experiment requires no change to this file.
+onExperimentChange(() => {
+  if (!PageContainer) return;
+  ApplyExperimentClasses(PageContainer);
+});
 
-  if (CloseButton) {
-    if (!closeBtnA) {
-      CloseButton.classList.add("Disabled");
-    } else {
-      CloseButton.addEventListener("click", closeBtnHandler);
-    }
-  }
+$viewControlsPosition.listen((v) => {
+  if (!PageContainer) return;
+  PageContainer.classList.toggle("ViewControlsPosition_Top", v === "Top");
+  PageContainer.classList.toggle("ViewControlsPosition_Bottom", v === "Bottom");
+  AppendViewControls(true);
+});
 
-  return {
-    cleanup: () => {
-      if (closeBtnA && CloseButton) {
-        CloseButton.removeEventListener("click", closeBtnHandler);
-      }
-      NotificationContainer.classList.remove("Visible");
-      NotificationContainer.classList.remove(type ?? "Information");
-      if (Title) {
-        Title.textContent = "";
-      }
-      if (Description) {
-        Description.textContent = "";
-      }
-      if (Icon) {
-        Icon.innerHTML = "";
-      }
-      if (CloseButton) {
-        CloseButton.classList.remove("Disabled");
-      }
-    },
-    close: () => {
-      NotificationContainer.classList.remove("Visible");
-    },
-    open: () => {
-      NotificationContainer.classList.add("Visible");
-    },
-  };
-}
-
-/* function SocketStatusChange(status: boolean) {
-    if (!PageView.IsOpened) return;
-    if (!document.querySelector("#SpicyLyricsPage")) return;
-    const notif = SpicyLyrics_Notification({
-        icon: Icons.LyricsPage,
-        metadata: {
-            title: "Connection Error",
-            description: "We're recconecting you back to Spicy Lyrics. Be patient."
-        },
-        type: "Warning",
-        closeBtn: false
-    })
-    if (status) {
-        notif.close();
-        notif.cleanup();
-    } else {
-        notif.open();
-    }
-}
-
-SocketStatusChange(isWsConnected); */
-
-type NotificationVariant = "info" | "success" | "warning" | "error";
-
-export const ShowNotification = (
-  content: string,
-  variant: NotificationVariant = "info",
-  autoHideDuration: number = 5000
-) => {
-  const AnySpicetify = Spicetify as any;
-  AnySpicetify.Snackbar.enqueueSnackbar(
-    Spicetify.React.createElement("div", null, content),
-    {
-      variant,
-      autoHideDuration,
-    }
-  );
-};
+$ttmlMakerMode.listen((v) => {
+  if (!PageContainer) return;
+  AppendViewControls(true);
+})
 
 export default PageView;

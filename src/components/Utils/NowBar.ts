@@ -1,18 +1,21 @@
-import { Maid } from "@spikerko/web-modules/Maid";
-import { Interval } from "@spikerko/web-modules/Scheduler";
-import Whentil from "@spikerko/tools/Whentil";
 import BlobURLMaker from "../../utils/BlobURLMaker.ts";
 import { GetCurrentLyricsContainerInstance } from "../../utils/Lyrics/Applyer/CreateLyricsContainer.ts";
 import { SongProgressBar } from "./../../utils/Lyrics/SongProgressBar.ts";
 import { QueueForceScroll, ResetLastLine } from "../../utils/Scrolling/ScrollToActiveLine.ts";
-import storage from "../../utils/storage.ts";
+import { $showVolumeSlider, $timelineOutsideMediaContent } from "../../utils/stores.ts";
+import { onExperimentChange } from "../../utils/experiments.ts";
+import { $isNowBarOpen, $nowBarSide } from "../../utils/uiState.ts";
 import Global from "../Global/Global.ts";
+import Session from "../Global/Session.ts";
 import { SpotifyPlayer } from "../Global/SpotifyPlayer.ts";
 import PageView, { PageContainer } from "../Pages/PageView.ts";
 import { Icons } from "../Styling/Icons.ts";
-import Fullscreen, { CleanupMediaBox } from "./Fullscreen.ts";
-import { isSpicySidebarMode } from "./SidebarLyrics.ts";
+import Fullscreen, { CleanupMediaBox, SetControlsDragLock } from "./Fullscreen.ts";
 import { IsPIP } from "./PopupLyrics.ts";
+import { IsCompactMode } from "./CompactMode.ts";
+import { Maid } from "../../modules/Maid.ts";
+import Scheduler from "../../modules/Scheduler.ts";
+import Whentil from "../../modules/Whentil.ts";
 
 // Define interfaces for our control instances
 interface PlaybackControlsInstance {
@@ -27,7 +30,17 @@ interface SongProgressBarInstance {
   GetElement: () => HTMLElement;
 }
 
+interface VolumeControlInstance {
+  Apply: () => void;
+  CleanUp: () => void;
+  GetElement: () => HTMLElement;
+  /** Render an externally-originated level without echoing it back to Spotify. */
+  SetVolume: (volume: number) => void;
+  IsDragging: () => boolean;
+}
+
 let ActivePlaybackControlsInstance: PlaybackControlsInstance | null = null;
+let ActiveVolumeControlInstance: VolumeControlInstance | null = null;
 const ActiveSongProgressBarInstance_Map = new Map<string, any>();
 let ActiveSetupSongProgressBarInstance: SongProgressBarInstance | null = null;
 
@@ -98,15 +111,37 @@ function ApplyMarquee(baseWidth, elementWidth, name) {
 
 let NowBarFullscreenMaid: Maid | null = null;
 
+function PositionTimelineElement(TimelineElem: HTMLElement) {
+  const forceInsideMediaContent = IsCompactMode() || IsPIP || !$timelineOutsideMediaContent.get();
+  if (forceInsideMediaContent) {
+    // In CompactMode, PIP, or when setting is off: place inside .MediaContent
+    const MediaContent = PageContainer?.querySelector<HTMLElement>(
+      ".ContentBox .NowBar .Header .MediaBox .MediaContent"
+    );
+    if (MediaContent && TimelineElem.parentNode !== MediaContent) {
+      MediaContent.appendChild(TimelineElem);
+    }
+  } else {
+    // Setting is on and no forced-inside condition: place in .Header before .Metadata
+    const Header = PageContainer?.querySelector<HTMLElement>(".ContentBox .NowBar .Header");
+    const Metadata = Header?.querySelector<HTMLElement>(".Metadata");
+    if (Header && Metadata && TimelineElem.parentNode !== Header) {
+      Header.insertBefore(TimelineElem, Metadata);
+    }
+  }
+}
+
+function RepositionTimeline() {
+  if (!ActiveSetupSongProgressBarInstance) return;
+  const TimelineElem = ActiveSetupSongProgressBarInstance.GetElement();
+  if (!TimelineElem) return;
+  PositionTimelineElement(TimelineElem);
+}
+
 function OpenNowBar(skipSaving: boolean = false) {
   const NowBar = PageContainer?.querySelector(".ContentBox .NowBar");
   if (!NowBar) return;
   const spicyLyricsPage = PageContainer;
-  if (isSpicySidebarMode) {
-    spicyLyricsPage?.classList.add("NowBarStatus__Closed");
-    spicyLyricsPage?.classList.remove("NowBarStatus__Open");
-    return;
-  }
   UpdateNowBar(true);
   NowBar.classList.add("Active");
 
@@ -115,7 +150,7 @@ function OpenNowBar(skipSaving: boolean = false) {
     spicyLyricsPage.classList.add("NowBarStatus__Open");
   }
 
-  if (!skipSaving) storage.set("IsNowBarOpen", "true");
+  if (!skipSaving) $isNowBarOpen.set(true);
 
   setTimeout(() => {
     // console.log("Resizing Lyrics Container");
@@ -194,7 +229,7 @@ function OpenNowBar(skipSaving: boolean = false) {
 
         let lastStatus: boolean | null = null;
         ActiveHeartMaid.Give(
-          Interval(0.05, () => {
+          Scheduler.Interval(() => {
             const IsLiked = SpotifyPlayer.IsLiked();
             if (IsLiked === lastStatus) return;
             lastStatus = IsLiked;
@@ -203,7 +238,7 @@ function OpenNowBar(skipSaving: boolean = false) {
             } else {
               HeartElement.classList.remove("Filled");
             }
-          })
+          }, 50)
         );
 
         AppendQueue.push(HeartElement);
@@ -232,10 +267,6 @@ function OpenNowBar(skipSaving: boolean = false) {
           const loopToggle = ControlsElement.querySelector(".LoopToggle");
           if (loopToggle) {
             loopToggle.classList.add("Enabled");
-            const loopSvg = ControlsElement.querySelector<HTMLElement>(".LoopToggle svg");
-            if (loopSvg) {
-              loopSvg.style.filter = "drop-shadow(0 0 5px white)";
-            }
           }
         }
 
@@ -243,45 +274,32 @@ function OpenNowBar(skipSaving: boolean = false) {
           const shuffleToggle = ControlsElement.querySelector(".ShuffleToggle");
           if (shuffleToggle) {
             shuffleToggle.classList.add("Enabled");
-            const shuffleSvg = ControlsElement.querySelector<HTMLElement>(".ShuffleToggle svg");
-            if (shuffleSvg) {
-              shuffleSvg.style.filter = "drop-shadow(0 0 5px white)";
-            }
           }
         }
 
-        // Store event handlers so they can be removed later
-        const eventHandlers = {
-          pressHandlers: new Map(),
-          releaseHandlers: new Map(),
-          clickHandlers: new Map(),
-        };
+        const controlsMaid = new Maid();
 
         // Find all playback controls
         const playbackControls = ControlsElement.querySelectorAll(".PlaybackControl");
 
         // Add event listeners to each control with named functions
         playbackControls.forEach((control) => {
-          // Create handlers for this specific control
-          const pressHandler = () => {
-            control.classList.add("Pressed");
-          };
+          const pressHandler = () => { control.classList.add("Pressed"); };
+          const releaseHandler = () => { control.classList.remove("Pressed"); };
 
-          const releaseHandler = () => {
-            control.classList.remove("Pressed");
-          };
-
-          // Store handlers in the Map with the control as the key
-          eventHandlers.pressHandlers.set(control, pressHandler);
-          eventHandlers.releaseHandlers.set(control, releaseHandler);
-
-          // Add event listeners
           control.addEventListener("mousedown", pressHandler);
           control.addEventListener("touchstart", pressHandler);
-
           control.addEventListener("mouseup", releaseHandler);
           control.addEventListener("mouseleave", releaseHandler);
           control.addEventListener("touchend", releaseHandler);
+
+          controlsMaid.Give(() => {
+            control.removeEventListener("mousedown", pressHandler);
+            control.removeEventListener("touchstart", pressHandler);
+            control.removeEventListener("mouseup", releaseHandler);
+            control.removeEventListener("mouseleave", releaseHandler);
+            control.removeEventListener("touchend", releaseHandler);
+          });
         });
 
         const PlayPauseControl = ControlsElement.querySelector(".PlayStateToggle");
@@ -338,80 +356,34 @@ function OpenNowBar(skipSaving: boolean = false) {
           }
         };
 
-        // Store click handlers
-        eventHandlers.clickHandlers.set(PlayPauseControl, playPauseHandler);
-        eventHandlers.clickHandlers.set(PrevTrackControl, prevTrackHandler);
-        eventHandlers.clickHandlers.set(NextTrackControl, nextTrackHandler);
-        eventHandlers.clickHandlers.set(ShuffleControl, shuffleHandler);
-        eventHandlers.clickHandlers.set(LoopControl, loopHandler);
-
-        // Add click event listeners
         if (PlayPauseControl) {
           PlayPauseControl.addEventListener("click", playPauseHandler);
+          const el = PlayPauseControl;
+          controlsMaid.Give(() => el.removeEventListener("click", playPauseHandler));
         }
         if (PrevTrackControl) {
           PrevTrackControl.addEventListener("click", prevTrackHandler);
+          const el = PrevTrackControl;
+          controlsMaid.Give(() => el.removeEventListener("click", prevTrackHandler));
         }
         if (NextTrackControl) {
           NextTrackControl.addEventListener("click", nextTrackHandler);
+          const el = NextTrackControl;
+          controlsMaid.Give(() => el.removeEventListener("click", nextTrackHandler));
         }
         if (ShuffleControl) {
           ShuffleControl.addEventListener("click", shuffleHandler);
+          const el = ShuffleControl;
+          controlsMaid.Give(() => el.removeEventListener("click", shuffleHandler));
         }
         if (LoopControl) {
           LoopControl.addEventListener("click", loopHandler);
+          const el = LoopControl;
+          controlsMaid.Give(() => el.removeEventListener("click", loopHandler));
         }
 
-        // Create and return a cleanup function
         const cleanup = () => {
-          // Remove press/release handlers
-          playbackControls.forEach((control) => {
-            const pressHandler = eventHandlers.pressHandlers.get(control);
-            const releaseHandler = eventHandlers.releaseHandlers.get(control);
-
-            control.removeEventListener("mousedown", pressHandler);
-            control.removeEventListener("touchstart", pressHandler);
-
-            control.removeEventListener("mouseup", releaseHandler);
-            control.removeEventListener("mouseleave", releaseHandler);
-            control.removeEventListener("touchend", releaseHandler);
-          });
-
-          // Remove click handlers
-          if (PlayPauseControl) {
-            PlayPauseControl.removeEventListener(
-              "click",
-              eventHandlers.clickHandlers.get(PlayPauseControl)
-            );
-          }
-          if (PrevTrackControl) {
-            PrevTrackControl.removeEventListener(
-              "click",
-              eventHandlers.clickHandlers.get(PrevTrackControl)
-            );
-          }
-          if (NextTrackControl) {
-            NextTrackControl.removeEventListener(
-              "click",
-              eventHandlers.clickHandlers.get(NextTrackControl)
-            );
-          }
-          if (ShuffleControl) {
-            ShuffleControl.removeEventListener(
-              "click",
-              eventHandlers.clickHandlers.get(ShuffleControl)
-            );
-          }
-          if (LoopControl) {
-            LoopControl.removeEventListener("click", eventHandlers.clickHandlers.get(LoopControl));
-          }
-
-          // Clear the maps
-          eventHandlers.pressHandlers.clear();
-          eventHandlers.releaseHandlers.clear();
-          eventHandlers.clickHandlers.clear();
-
-          // Remove the controls element from DOM if it exists
+          controlsMaid.Destroy();
           if (ControlsElement.parentNode) {
             ControlsElement.parentNode.removeChild(ControlsElement);
           }
@@ -509,7 +481,12 @@ function OpenNowBar(skipSaving: boolean = false) {
 
         const handleDragStart = (event: MouseEvent | TouchEvent) => {
           isDragging = true;
+          // .Dragging keeps the bar thickened and turns off the fill's eased glide
+          // so it tracks the pointer 1:1.
+          SliderBar.classList.add("Dragging");
           document.body.style.userSelect = "none"; // Prevent text selection during drag
+          // Keep the overlay visible if the pointer leaves the artwork mid-drag
+          SetControlsDragLock(true);
 
           // Add the event listeners for drag movement and end
           document.addEventListener("mousemove", handleDragMove);
@@ -568,6 +545,7 @@ function OpenNowBar(skipSaving: boolean = false) {
         const handleDragEnd = (event: MouseEvent | TouchEvent) => {
           if (!isDragging) return;
           isDragging = false;
+          SliderBar.classList.remove("Dragging");
           document.body.style.userSelect = ""; // Restore text selection
 
           // Remove the event listeners
@@ -606,7 +584,11 @@ function OpenNowBar(skipSaving: boolean = false) {
 
           // After seeking, update the timeline state to reflect the new position
           updateTimelineState();
+
+          SetControlsDragLock(false);
         };
+
+        const timelineMaid = new Maid();
 
         // Add event listeners for drag
         SliderBar.addEventListener("mousedown", handleDragStart);
@@ -615,53 +597,262 @@ function OpenNowBar(skipSaving: boolean = false) {
         // Keep the click handler for simple clicks
         SliderBar.addEventListener("click", sliderBarHandler);
 
+        timelineMaid.Give(() => {
+          SliderBar.removeEventListener("click", sliderBarHandler);
+          SliderBar.removeEventListener("mousedown", handleDragStart);
+          SliderBar.removeEventListener("touchstart", handleDragStart);
+          document.removeEventListener("mousemove", handleDragMove);
+          document.removeEventListener("touchmove", handleDragMove);
+          document.removeEventListener("mouseup", handleDragEnd);
+          document.removeEventListener("touchend", handleDragEnd);
+          if (isDragging) {
+            isDragging = false;
+            SliderBar.classList.remove("Dragging");
+            document.body.style.userSelect = "";
+            SetControlsDragLock(false);
+          }
+        });
+
         // Run initial update
         updateTimelineState();
         ActiveSongProgressBarInstance_Map.set("updateTimelineState_Function", updateTimelineState);
 
         const cleanup = () => {
-          // Remove event listeners
-          if (SliderBar) {
-            SliderBar.removeEventListener("click", sliderBarHandler);
-            SliderBar.removeEventListener("mousedown", handleDragStart);
-            SliderBar.removeEventListener("touchstart", handleDragStart);
-
-            // Also remove any potentially active document listeners
-            document.removeEventListener("mousemove", handleDragMove);
-            document.removeEventListener("touchmove", handleDragMove);
-            document.removeEventListener("mouseup", handleDragEnd);
-            document.removeEventListener("touchend", handleDragEnd);
-          }
-
-          // Clean up the progress bar instance
-          const progressBar = ActiveSongProgressBarInstance_Map.get(
-            "SongProgressBar_ClassInstance"
-          );
-          if (progressBar) {
-            progressBar.Destroy();
-          }
-
-          // Remove the timeline element from DOM if it's attached
-          if (TimelineElem.parentNode) {
-            TimelineElem.parentNode.removeChild(TimelineElem);
-          }
-
-          // Clear the map
+          timelineMaid.Destroy();
+          const progressBar = ActiveSongProgressBarInstance_Map.get("SongProgressBar_ClassInstance");
+          if (progressBar) progressBar.Destroy();
+          if (TimelineElem.parentNode) TimelineElem.parentNode.removeChild(TimelineElem);
           ActiveSongProgressBarInstance_Map.clear();
         };
 
         return {
           Apply: () => {
-            AppendQueue.push(TimelineElem);
+            if (IsCompactMode() || IsPIP || !$timelineOutsideMediaContent.get()) {
+              // Timeline goes inside MediaContent — must use AppendQueue
+              // because Whentil.When wipes MediaContent with innerHTML = ""
+              AppendQueue.push(TimelineElem);
+            } else {
+              PositionTimelineElement(TimelineElem);
+            }
           },
           GetElement: () => TimelineElem,
           CleanUp: cleanup,
         };
       };
 
+      const SetupVolumeControl = () => {
+        const VolumeElement = document.createElement("div");
+        VolumeElement.classList.add("VolumeControl");
+        // A vertical capsule in both progress-bar skins — same box, same drag axis.
+        // Only the paint differs, so both the fill (new skin) and the handle
+        // (legacy) are always present and CSS hides whichever doesn't apply.
+        VolumeElement.innerHTML = `
+                    <div class="VolumeFill"></div>
+                    <div class="Handle"></div>
+                    <div class="VolumeIcon">${Icons.Volume}</div>
+                `;
+
+        // Same trick the Heart uses — the SVG would otherwise swallow the clicks
+        // meant for the .VolumeIcon container.
+        const svgElement = VolumeElement.querySelector("svg");
+        if (svgElement) {
+          svgElement.style.pointerEvents = "none";
+          svgElement.querySelectorAll("path").forEach((path) => {
+            path.style.pointerEvents = "none";
+          });
+        }
+
+        const IconElement = VolumeElement.querySelector<HTMLElement>(".VolumeIcon");
+        if (!IconElement) {
+          console.error("Could not find VolumeControl elements");
+          return null;
+        }
+
+        const volumeMaid = new Maid();
+
+        let isDragging = false;
+        let currentLevel = 0;
+
+        const clamp = (value: number) => Math.max(0, Math.min(1, value));
+
+        // The glyph rests near the foot of the capsule (centered ~3cqh up a 32cqh
+        // track); once the fill's top edge clears it the icon sits on solid white,
+        // and .IconOnFill flips it from white to ink. Only the new skin acts on
+        // this class — the legacy skin's traveled colour keeps the glyph white.
+        const ICON_COVERED_LEVEL = 0.09;
+
+        // `getVolume()` returns 0 while muted and `toggleMute()` restores the previous
+        // level internally, so a single number drives both the bar and the icon —
+        // there's nothing to remember on our side and no `getMute()` call anywhere.
+        // Dragging to a genuine 0 therefore shows the muted icon, which is intended.
+
+        const render = (volume: number) => {
+          const level = clamp(volume);
+          currentLevel = level;
+          // One variable drives both skins: the new skin's fill scale and the
+          // legacy skin's gradient stop plus handle offset all read --VolumeLevel.
+          VolumeElement.style.setProperty("--VolumeLevel", level.toString());
+          VolumeElement.classList.toggle("IconOnFill", level >= ICON_COVERED_LEVEL);
+          VolumeElement.classList.toggle("Muted", level <= 0);
+          VolumeElement.classList.toggle("Low", level > 0 && level < 0.5);
+          VolumeElement.classList.toggle("High", level >= 0.5);
+        };
+
+        const commit = (volume: number) => {
+          const level = clamp(volume);
+          const wasMuted = currentLevel <= 0;
+          render(level);
+          try {
+            // Raising the bar out of a mute: lift the mute flag first, in case
+            // setVolume alone doesn't clear it.
+            if (wasMuted && level > 0) {
+              Spicetify.Player.setMute?.(false);
+            }
+            Spicetify.Player.setVolume(level);
+          } catch (err) {
+            console.error("Spicy Lyrics: couldn't set the volume", err);
+          }
+        };
+
+        const percentageFromEvent = (event: MouseEvent | TouchEvent) => {
+          let clientY: number;
+          if ("touches" in event && event.touches.length > 0) {
+            clientY = event.touches[0].clientY;
+          } else if ("changedTouches" in event && event.changedTouches.length > 0) {
+            clientY = event.changedTouches[0].clientY;
+          } else {
+            clientY = (event as MouseEvent).clientY;
+          }
+
+          const rect = VolumeElement.getBoundingClientRect();
+          if (rect.height === 0) return currentLevel;
+          return clamp(1 - (clientY - rect.top) / rect.height);
+        };
+
+        // Volume has no seek cost, so we commit live on every move instead of only
+        // on release like the timeline does. A plain click is covered too — mousedown
+        // starts the drag and immediately commits the position under the cursor.
+        const handleDragStart = (event: MouseEvent | TouchEvent) => {
+          // The glyph zone at the foot of the capsule is the mute button, not part
+          // of the track — starting a drag there would slam the volume to ~5% on
+          // every mute click.
+          if ((event.target as HTMLElement | null)?.closest?.(".VolumeIcon")) return;
+          isDragging = true;
+          // .Dragging keeps the capsule expanded and turns off the fill's eased
+          // glide so it tracks the pointer 1:1.
+          VolumeElement.classList.add("Dragging");
+          document.body.style.userSelect = "none";
+          // Keep the overlay from fading out when the pointer leaves the artwork
+          // while the fill is still held.
+          SetControlsDragLock(true);
+
+          document.addEventListener("mousemove", handleDragMove);
+          document.addEventListener("touchmove", handleDragMove);
+          document.addEventListener("mouseup", handleDragEnd);
+          document.addEventListener("touchend", handleDragEnd);
+
+          handleDragMove(event);
+        };
+
+        const handleDragMove = (event: MouseEvent | TouchEvent) => {
+          if (!isDragging) return;
+          commit(percentageFromEvent(event));
+        };
+
+        const handleDragEnd = (event: MouseEvent | TouchEvent) => {
+          if (!isDragging) return;
+          isDragging = false;
+          VolumeElement.classList.remove("Dragging");
+          document.body.style.userSelect = "";
+
+          document.removeEventListener("mousemove", handleDragMove);
+          document.removeEventListener("touchmove", handleDragMove);
+          document.removeEventListener("mouseup", handleDragEnd);
+          document.removeEventListener("touchend", handleDragEnd);
+
+          commit(percentageFromEvent(event));
+          SetControlsDragLock(false);
+        };
+
+        const iconHandler = () => {
+          try {
+            Spicetify.Player.toggleMute();
+          } catch (err) {
+            console.error("Spicy Lyrics: couldn't toggle mute", err);
+            return;
+          }
+
+          // The `volume` event normally drives the icon on its own; this one-shot
+          // resync covers the case where that internal emitter isn't available.
+          const resync = window.setTimeout(() => {
+            if (isDragging) return;
+            render(Spicetify.Player.getVolume() ?? 0);
+          }, 60);
+          volumeMaid.Give(() => clearTimeout(resync), "MuteResync");
+        };
+
+        const wheelHandler = (event: WheelEvent) => {
+          // Without this the lyrics underneath scroll along with the volume change.
+          event.preventDefault();
+          event.stopPropagation();
+          const step = 0.05;
+          commit(event.deltaY < 0 ? currentLevel + step : currentLevel - step);
+        };
+
+        VolumeElement.addEventListener("mousedown", handleDragStart);
+        VolumeElement.addEventListener("touchstart", handleDragStart);
+        IconElement.addEventListener("click", iconHandler);
+        VolumeElement.addEventListener("wheel", wheelHandler, { passive: false });
+
+        volumeMaid.Give(() => {
+          VolumeElement.removeEventListener("mousedown", handleDragStart);
+          VolumeElement.removeEventListener("touchstart", handleDragStart);
+          IconElement.removeEventListener("click", iconHandler);
+          VolumeElement.removeEventListener("wheel", wheelHandler);
+          document.removeEventListener("mousemove", handleDragMove);
+          document.removeEventListener("touchmove", handleDragMove);
+          document.removeEventListener("mouseup", handleDragEnd);
+          document.removeEventListener("touchend", handleDragEnd);
+          if (isDragging) {
+            isDragging = false;
+            VolumeElement.classList.remove("Dragging");
+            document.body.style.userSelect = "";
+            SetControlsDragLock(false);
+          }
+        });
+
+        // The `volume` event only fires on change, so seed the initial state here
+        // and let events drive it from then on.
+        render(Spicetify.Player.getVolume() ?? 0);
+
+        const cleanup = () => {
+          volumeMaid.Destroy();
+          if (VolumeElement.parentNode) {
+            VolumeElement.parentNode.removeChild(VolumeElement);
+          }
+        };
+
+        return {
+          Apply: () => {
+            AppendQueue.push(VolumeElement);
+          },
+          CleanUp: cleanup,
+          GetElement: () => VolumeElement,
+          SetVolume: (volume: number) => render(volume),
+          IsDragging: () => isDragging,
+        };
+      };
+
       ActivePlaybackControlsInstance = SetupPlaybackControls();
       if (ActivePlaybackControlsInstance) {
         ActivePlaybackControlsInstance.Apply();
+      }
+
+      if ($showVolumeSlider.get()) {
+        ActiveVolumeControlInstance = SetupVolumeControl();
+        if (ActiveVolumeControlInstance) {
+          ActiveVolumeControlInstance.Apply();
+        }
       }
 
       ActiveSetupSongProgressBarInstance = SetupSongProgressBar();
@@ -737,7 +928,7 @@ function OpenNowBar(skipSaving: boolean = false) {
         );
 
         DragBox.addEventListener("dragstart", (e) => {
-            const missingLyrics = storage.get("currentLyricsData")?.toString() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
+            const missingLyrics = $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
             if (missingLyrics) return;
 
             // Don't prevent default - allow the drag to start
@@ -763,7 +954,7 @@ function OpenNowBar(skipSaving: boolean = false) {
         });
 
         DragBox.addEventListener("dragend", () => {
-            const missingLyrics = storage.get("currentLyricsData")?.toString() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
+            const missingLyrics = $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
             if (missingLyrics) return;
             document.querySelector("#SpicyLyricsPage").classList.remove("SomethingDragging");
             dropZones.forEach((zone) => zone.classList.remove("Hidden"));
@@ -773,20 +964,20 @@ function OpenNowBar(skipSaving: boolean = false) {
         dropZones.forEach((zone) => {
             zone.addEventListener("dragover", (e) => {
                 e.preventDefault();
-                const missingLyrics = storage.get("currentLyricsData")?.toString() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
+                const missingLyrics = $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
                 if (missingLyrics) return;
                 zone.classList.add("DraggingOver");
             });
 
             zone.addEventListener("dragleave", () => {
-                const missingLyrics = storage.get("currentLyricsData")?.toString() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
+                const missingLyrics = $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
                 if (missingLyrics) return;
                 zone.classList.remove("DraggingOver");
             });
 
             zone.addEventListener("drop", (e) => {
                 e.preventDefault();
-                const missingLyrics = storage.get("currentLyricsData")?.toString() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
+                const missingLyrics = $currentLyricsData.get() === `NO_LYRICS:${SpotifyPlayer.GetSongId()}`;
                 if (missingLyrics) return;
                 zone.classList.remove("DraggingOver");
 
@@ -834,28 +1025,40 @@ function CleanUpActiveComponents() {
     // // console.log("Cleaned up SongProgressBar instance");
   }
 
+  if (ActiveVolumeControlInstance) {
+    ActiveVolumeControlInstance?.CleanUp();
+    ActiveVolumeControlInstance = null;
+  }
+
   if (ActiveSongProgressBarInstance_Map.size > 0) {
     ActiveSongProgressBarInstance_Map?.clear();
     // // console.log("Cleared SongProgressBar instance map");
   }
 
   // Also remove any leftover elements
-  const MediaBox = PageContainer.querySelector(
+  const MediaContent = PageContainer?.querySelector(
     ".ContentBox .NowBar .Header .MediaBox .MediaContent"
   );
 
-  if (MediaBox) {
-    const heart = MediaBox.querySelector(".Heart");
-    if (heart) MediaBox.removeChild(heart);
+  if (MediaContent) {
+    const heart = MediaContent.querySelector(".Heart");
+    if (heart) MediaContent.removeChild(heart);
 
-    const playbackControls = MediaBox.querySelector(".PlaybackControls");
-    if (playbackControls) MediaBox.removeChild(playbackControls);
+    const playbackControls = MediaContent.querySelector(".PlaybackControls");
+    if (playbackControls) MediaContent.removeChild(playbackControls);
 
-    const songProgressBar = MediaBox.querySelector(".SongProgressBar");
-    if (songProgressBar) MediaBox.removeChild(songProgressBar);
+    const timeline = MediaContent.querySelector(".Timeline");
+    if (timeline) MediaContent.removeChild(timeline);
 
-    // // console.log("Cleared elements from DOM");
+    const volumeControl = MediaContent.querySelector(".VolumeControl");
+    if (volumeControl) MediaContent.removeChild(volumeControl);
   }
+
+  // Also remove Timeline if it was placed in the Header
+  const headerTimeline = PageContainer?.querySelector(
+    ".ContentBox .NowBar .Header > .Timeline"
+  );
+  if (headerTimeline) headerTimeline.remove();
 
   // // console.log("Finished CleanUpActiveComponents Process");
 }
@@ -865,7 +1068,7 @@ function CloseNowBar() {
   const NowBar = PageContainer.querySelector(".ContentBox .NowBar");
   if (!NowBar) return;
   NowBar.classList.remove("Active");
-  storage.set("IsNowBarOpen", "false");
+  $isNowBarOpen.set(false);
   CleanUpActiveComponents();
 
   const spicyLyricsPage = PageContainer;
@@ -885,8 +1088,7 @@ function CloseNowBar() {
 }
 
 function ToggleNowBar() {
-  const IsNowBarOpen = storage.get("IsNowBarOpen");
-  if (IsNowBarOpen === "true") {
+  if ($isNowBarOpen.get()) {
     CloseNowBar();
   } else {
     OpenNowBar();
@@ -894,8 +1096,7 @@ function ToggleNowBar() {
 }
 
 function Session_OpenNowBar() {
-  const IsNowBarOpen = storage.get("IsNowBarOpen");
-  if (IsNowBarOpen === "true") {
+  if ($isNowBarOpen.get()) {
     OpenNowBar();
   } else {
     CloseNowBar();
@@ -1046,12 +1247,11 @@ function UpdateNowBar(force = false) {
   const MetadataContainer = NowBar.querySelector(".Header .Metadata");
   const ArtistsSpan = MetadataContainer.querySelector(".Artists span");
   const MediaImageContainer = NowBar.querySelector<HTMLDivElement>(".Header .MediaBox .MediaImageContainer");
-  const SongNameSpan = MetadataContainer.querySelector(".SongName span");
+  const SongNameSpan = MetadataContainer.querySelector<HTMLElement>(".SongName span");
   //const MediaBox = NowBar.querySelector(".Header .MediaBox");
   //const SongName = NowBar.querySelector(".Header .Metadata .SongName");
 
-  const IsNowBarOpen = storage.get("IsNowBarOpen");
-  if (IsNowBarOpen === "false" && !force) return;
+  if (!$isNowBarOpen.get() && !force) return;
 
   const coverArt = SpotifyPlayer.GetCover("xlarge");
 
@@ -1062,7 +1262,13 @@ function UpdateNowBar(force = false) {
 
   const previousCoverArt = MediaImageContainer.getAttribute("last-image");
   const previousCoverArtUrl = MediaImageContainer.getAttribute("last-image-url");
-  const finalUrl = `https://i.scdn.co/image/${coverArt.replace("spotify:image:", "")}`;
+  const isLocalCover = coverArt.startsWith("spotify:local");
+  // Only `spotify:image:` URIs live on scdn. Local URIs and already-absolute URLs
+  // (e.g. the `SongPlaceholderFull.png` fallback) must be used verbatim — blindly
+  // prefixing them produces `https://i.scdn.co/image/https://…` and a 404.
+  const finalUrl = coverArt.startsWith("spotify:image:")
+    ? `https://i.scdn.co/image/${coverArt.slice("spotify:image:".length)}`
+    : coverArt;
 
   // Avoid re-running if the artwork hasn't changed
   if (previousCoverArt === coverArt) {
@@ -1090,9 +1296,14 @@ function UpdateNowBar(force = false) {
     const updateToken = `${SpotifyPlayer.GetId() ?? ""}:${coverArt}`;
     MediaImageContainer.setAttribute("data-update-token", updateToken);
 
-    BlobURLMaker(finalUrl)
-      .then((blobUrl) => blobUrl ?? coverArt)
-      .catch(() => coverArt)
+    // Local files don't have a remote scdn URL to fetch; use the cover URL directly.
+    const displayUrlPromise = isLocalCover
+      ? Promise.resolve(finalUrl)
+      : BlobURLMaker(finalUrl)
+          .then((blobUrl) => blobUrl ?? coverArt)
+          .catch(() => coverArt);
+
+    displayUrlPromise
       .then((displayUrl) => {
         // If the container was removed or a newer update ran while we were loading, skip
         if (!MediaImageContainer.isConnected) return;
@@ -1162,21 +1373,66 @@ function UpdateNowBar(force = false) {
     const songName = SpotifyPlayer.GetName();
     if (SongNameSpan) {
       SongNameSpan.textContent = songName ?? "";
+      if (Fullscreen.IsOpen) {
+        const albumUri = (Spicetify?.Player?.data?.item as any)?.metadata?.album_uri as string | undefined;
+        const albumId = albumUri?.split(":")?.[2];
+        if (albumId) {
+          SongNameSpan.classList.add("Clickable");
+          SongNameSpan.onclick = async () => {
+            await Fullscreen.Close();
+            Session.Navigate({ pathname: `/album/${albumId}` });
+          };
+        } else {
+          SongNameSpan.classList.remove("Clickable");
+          SongNameSpan.onclick = null;
+        }
+      } else {
+        SongNameSpan.classList.remove("Clickable");
+        SongNameSpan.onclick = null;
+      }
     }
-  
+
     const contentType = SpotifyPlayer.GetContentType();
-  
+    const ArtistsDiv = MetadataContainer.querySelector<HTMLElement>(".Artists");
+
     if (contentType === "episode") {
       const showName = SpotifyPlayer.GetShowName();
-      ArtistsSpan.textContent = showName ?? "";
+      if (ArtistsDiv) {
+        ArtistsDiv.innerHTML = "<span></span>";
+        const span = ArtistsDiv.querySelector("span");
+        if (span) span.textContent = showName ?? "";
+      }
     }
-  
+
     const artists = SpotifyPlayer.GetArtists();
-    if (artists && ArtistsSpan && contentType !== "episode") {
-      const processedArtists = artists.map((artist) => artist.name)?.join(", ");
-      ArtistsSpan.textContent = processedArtists ?? "";
+    if (artists && ArtistsDiv && contentType !== "episode") {
+      if (Fullscreen.IsOpen) {
+        ArtistsDiv.innerHTML = "";
+        const scrollWrapper = document.createElement("span");
+        artists.forEach((artist, idx) => {
+          const artistId = (artist.uri as string | undefined)?.split(":")?.[2];
+          const span = document.createElement("span");
+          span.textContent = artist.name;
+          if (artistId) {
+            span.classList.add("Clickable");
+            span.onclick = async () => {
+              await Fullscreen.Close();
+              Session.Navigate({ pathname: `/artist/${artistId}` });
+            };
+          }
+          scrollWrapper.appendChild(span);
+          if (idx < artists.length - 1) {
+            scrollWrapper.appendChild(document.createTextNode(", "));
+          }
+        });
+        ArtistsDiv.appendChild(scrollWrapper);
+      } else {
+        ArtistsDiv.innerHTML = "<span></span>";
+        const span = ArtistsDiv.querySelector("span");
+        if (span) span.textContent = artists.map((artist) => artist.name).join(", ");
+      }
     }
-  
+
     setTimeout(() => MetadataContainer.classList.remove("tr_VisuallyHidden"), 80);
   }, 350);
 }
@@ -1189,21 +1445,21 @@ function NowBar_SwapSides() {
   const spicyLyricsPage = PageContainer;
   if (!spicyLyricsPage) return;
 
-  const CurrentSide = storage.get("NowBarSide");
+  const CurrentSide = $nowBarSide.get();
   if (CurrentSide === "left") {
-    storage.set("NowBarSide", "right");
+    $nowBarSide.set("right");
     NowBar.classList.remove("LeftSide");
     NowBar.classList.add("RightSide");
     spicyLyricsPage.classList.remove("NowBarSide__Left");
     spicyLyricsPage.classList.add("NowBarSide__Right");
   } else if (CurrentSide === "right") {
-    storage.set("NowBarSide", "left");
+    $nowBarSide.set("left");
     NowBar.classList.remove("RightSide");
     NowBar.classList.add("LeftSide");
     spicyLyricsPage.classList.remove("NowBarSide__Right");
     spicyLyricsPage.classList.add("NowBarSide__Left");
   } else {
-    storage.set("NowBarSide", "right");
+    $nowBarSide.set("right");
     NowBar.classList.remove("LeftSide");
     NowBar.classList.add("RightSide");
     spicyLyricsPage.classList.remove("NowBarSide__Left");
@@ -1225,21 +1481,19 @@ function Session_NowBar_SetSide() {
   const spicyLyricsPage = PageContainer;
   if (!spicyLyricsPage) return;
 
-  const CurrentSide = storage.get("NowBarSide");
+  const CurrentSide = $nowBarSide.get();
   if (CurrentSide === "left") {
-    storage.set("NowBarSide", "left");
     NowBar.classList.remove("RightSide");
     NowBar.classList.add("LeftSide");
     spicyLyricsPage.classList.remove("NowBarSide__Right");
     spicyLyricsPage.classList.add("NowBarSide__Left");
   } else if (CurrentSide === "right") {
-    storage.set("NowBarSide", "right");
     NowBar.classList.remove("LeftSide");
     NowBar.classList.add("RightSide");
     spicyLyricsPage.classList.remove("NowBarSide__Left");
     spicyLyricsPage.classList.add("NowBarSide__Right");
   } else {
-    storage.set("NowBarSide", "left");
+    $nowBarSide.set("left");
     NowBar.classList.remove("RightSide");
     NowBar.classList.add("LeftSide");
     spicyLyricsPage.classList.remove("NowBarSide__Right");
@@ -1293,11 +1547,8 @@ Global.Event.listen("playback:playpause", (e: { data: { isPaused: boolean } }) =
 });
 
 Global.Event.listen("playback:loop", (e: string) => {
-  // console.log("Loop", e);
   if (Fullscreen.IsOpen) {
-    // console.log("Fullscreen Opened");
     if (ActivePlaybackControlsInstance) {
-      // console.log("ActivePlaybackControlsInstance - Exists");
       const PlaybackControls = ActivePlaybackControlsInstance.GetElement();
       const LoopButton = PlaybackControls.querySelector(".LoopToggle");
       if (!LoopButton) return;
@@ -1305,21 +1556,14 @@ Global.Event.listen("playback:loop", (e: string) => {
       const SVG = LoopButton.querySelector("svg");
       if (!SVG) return;
 
-      // First reset any inline styles
-      SVG.style.filter = "";
-
-      // Update loop icon
       if (e === "track") {
         SVG.innerHTML = Icons.LoopTrack;
       } else {
         SVG.innerHTML = Icons.Loop;
       }
 
-      // Toggle class for brightness
       if (e !== "none") {
         LoopButton.classList.add("Enabled");
-        // Apply drop-shadow directly via style
-        SVG.style.filter = "drop-shadow(0 0 5px white)";
       } else {
         LoopButton.classList.remove("Enabled");
       }
@@ -1328,26 +1572,14 @@ Global.Event.listen("playback:loop", (e: string) => {
 });
 
 Global.Event.listen("playback:shuffle", (e: string) => {
-  // console.log("Shuffle", e);
   if (Fullscreen.IsOpen) {
-    // console.log("Fullscreen Opened");
     if (ActivePlaybackControlsInstance) {
-      // console.log("ActivePlaybackControlsInstance - Exists");
       const PlaybackControls = ActivePlaybackControlsInstance.GetElement();
       const ShuffleButton = PlaybackControls.querySelector(".ShuffleToggle");
       if (!ShuffleButton) return;
 
-      const SVG = ShuffleButton.querySelector("svg");
-      if (!SVG) return;
-
-      // First reset any inline styles
-      SVG.style.filter = "";
-
-      // Toggle class for brightness
       if (e !== "none") {
         ShuffleButton.classList.add("Enabled");
-        // Apply drop-shadow directly via style
-        SVG.style.filter = "drop-shadow(0 0 5px white)";
       } else {
         ShuffleButton.classList.remove("Enabled");
       }
@@ -1367,6 +1599,16 @@ Global.Event.listen("playback:position", (e: number) => {
   }
 });
 
+Global.Event.listen("playback:volume", (volume: number) => {
+  if (!Fullscreen.IsOpen) return;
+  if (!$showVolumeSlider.get()) return;
+  if (!ActiveVolumeControlInstance) return;
+  // Every setVolume we issue echoes straight back as a volume event — applying it
+  // mid-drag would fight the handle under the cursor.
+  if (ActiveVolumeControlInstance.IsDragging()) return;
+  ActiveVolumeControlInstance.SetVolume(volume);
+});
+
 Global.Event.listen("fullscreen:exit", () => {
   CleanUpActiveComponents();
   CleanupMediaBox();
@@ -1380,6 +1622,36 @@ Global.Event.listen("page:destroy", () => {
 Global.Event.listen("nowbar:timeline:dragging", () => {
   ResetLastLine();
   QueueForceScroll();
+});
+
+Global.Event.listen("compact-mode:enable", () => {
+  RepositionTimeline();
+});
+
+Global.Event.listen("compact-mode:disable", () => {
+  RepositionTimeline();
+});
+
+$timelineOutsideMediaContent.subscribe(() => {
+  RepositionTimeline();
+});
+
+// The band is built inside OpenNowBar's fullscreen block, so toggling the setting
+// has to rebuild the overlay components rather than just show/hide an element.
+// `.listen` (not `.subscribe`) — this must not fire on module load.
+$showVolumeSlider.listen(() => {
+  if (!Fullscreen.IsOpen) return;
+  CleanUpActiveComponents();
+  OpenNowBar(true);
+});
+
+// Experiments flagged `rebuildsNowBar` change the overlay's markup, not just its
+// CSS, so the components have to be rebuilt the same way the setting above does.
+onExperimentChange((experiment) => {
+  if (!experiment.rebuildsNowBar) return;
+  if (!Fullscreen.IsOpen) return;
+  CleanUpActiveComponents();
+  OpenNowBar(true);
 });
 
 export {

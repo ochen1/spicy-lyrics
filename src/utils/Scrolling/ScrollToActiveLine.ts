@@ -1,4 +1,4 @@
-import Defaults from "../../components/Global/Defaults.ts";
+import { $currentLyricsType, $lyricsContainerExists } from "../../utils/stores.ts";
 import Global from "../../components/Global/Global.ts";
 import { SpotifyPlayer } from "../../components/Global/SpotifyPlayer.ts";
 import { PageContainer } from "../../components/Pages/PageView.ts";
@@ -12,6 +12,7 @@ import {
 } from "../Lyrics/lyrics.ts";
 import { ScrollIntoCenterViewCSS } from "../ScrollIntoView/Center.ts";
 import { ScrollIntoTopViewCSS } from "../ScrollIntoView/Top.ts";
+import { getLyricsVirtualizer, scrollLyricsToIndex } from "../Lyrics/LyricsVirtualizer.ts";
 
 // Define intersection types that include _LineIndex
 type LyricsLineWithIndex = LyricsLine & { _LineIndex: number };
@@ -85,7 +86,7 @@ function handleUserScroll(ScrollSimplebar: any | null) {
 
 // Initialization function for scroll events and observers
 export function InitializeScrollEvents(ScrollSimplebar: any) {
-  if (!Defaults.LyricsContainerExists) return;
+  if (!$lyricsContainerExists.get()) return;
   // --- NEW: Store instance and define handlers ---
   currentSimpleBarInstance = ScrollSimplebar;
   wheelHandler = () => handleUserScroll(currentSimpleBarInstance);
@@ -108,44 +109,116 @@ export function InitializeScrollEvents(ScrollSimplebar: any) {
   }
 }
 
+/**
+ * How far ahead — counted in real lyric lines, background lines excluded — we
+ * look when deciding whether the highest active line may keep the anchor.
+ * Bump to 3 to let long lines hold the anchor for longer.
+ */
+const PIN_LOOKAHEAD = 2;
+
+/** Only Syllable lines carry BGLine; line-synced lyrics have no background lines. */
+const IsBGLine = (line: LyricsLine | LyricsSyllable): boolean =>
+  (line as LyricsSyllable).BGLine === true;
+
+/** Background lines belong to the lead line above them, and are never a scroll target. */
+const ResolveToLeadIndex = (Lines: LyricsLine[] | LyricsSyllable[], index: number): number => {
+  let i = index;
+  while (i > 0 && IsBGLine(Lines[i])) i--;
+  return i;
+};
+
+/** When the lead line at `leadIdx` and its background lines have all finished. */
+const GetGroupEndTime = (Lines: LyricsLine[] | LyricsSyllable[], leadIdx: number): number => {
+  let end = Lines[leadIdx].EndTime;
+  for (let i = leadIdx + 1; i < Lines.length && IsBGLine(Lines[i]); i++) {
+    if (Lines[i].EndTime > end) end = Lines[i].EndTime;
+  }
+  return end;
+};
+
+/** The PIN_LOOKAHEAD-th non-background line after `leadIdx`, or null past the end. */
+const GetLookaheadLine = (Lines: LyricsLine[] | LyricsSyllable[], leadIdx: number) => {
+  let remaining = PIN_LOOKAHEAD;
+  for (let i = leadIdx + 1; i < Lines.length; i++) {
+    if (IsBGLine(Lines[i])) continue;
+    if (--remaining === 0) return Lines[i];
+  }
+  return null;
+};
+
 const GetScrollLine = (Lines: LyricsLine[] | LyricsSyllable[], ProcessedPosition: number) => {
-  if (Defaults.CurrentLyricsType === "Static" || Defaults.CurrentLyricsType === "None" || !Lines)
+  if ($currentLyricsType.get() === "Static" || $currentLyricsType.get() === "None" || !Lines)
     return;
-  // 1) gather all active lines
-  const activeLines = Lines.map((line, idx) => ({ line, idx }))
-    .filter(
-      ({ line }) =>
-        typeof line.StartTime === "number" &&
-        typeof line.EndTime === "number" &&
-        line.StartTime <= ProcessedPosition &&
-        line.EndTime >= ProcessedPosition
-    )
-    .map(({ line, idx }) => ({ ...line, _LineIndex: idx }) as EnhancedLyricsItem); // Cast here
-
-  // 3) if zero or one, just return it (or undefined if none)
-  if (activeLines.length <= 1) {
-    return activeLines[0] || null;
+  // 1) gather the indices of all active lines. This runs every animation frame,
+  // so we keep indices rather than materialising a copy of each active line.
+  const activeIndices: number[] = [];
+  for (let i = 0; i < Lines.length; i++) {
+    const line = Lines[i];
+    if (
+      typeof line.StartTime === "number" &&
+      typeof line.EndTime === "number" &&
+      line.StartTime <= ProcessedPosition &&
+      line.EndTime >= ProcessedPosition
+    ) {
+      activeIndices.push(i);
+    }
   }
 
-  // more than one → check the span between first and last
-  const firstIdx = activeLines[0]._LineIndex;
-  const lastIdx = activeLines[activeLines.length - 1]._LineIndex;
+  if (activeIndices.length === 0) return null;
 
-  // 1) contiguous or off by only 1 → pick the first
-  if (lastIdx - firstIdx <= 1) {
-    return activeLines[0];
+  const enhance = (index: number) =>
+    ({ ...Lines[index], _LineIndex: index }) as EnhancedLyricsItem;
+
+  // 2) collapse the active lines onto their lead groups. A background line that
+  // still has another active group below it is only the tail of a line we have
+  // already moved past — a sustained "oooh" outliving its own lead — so it is
+  // dropped rather than dragging the anchor back up. A background line with
+  // nothing active below it is kept: it may be leading into its own line, which
+  // starts later than the background vocal does.
+  let frontLead = -1;
+  for (const index of activeIndices) {
+    const lead = ResolveToLeadIndex(Lines, index);
+    if (lead > frontLead) frontLead = lead;
   }
 
-  // 2) "gap" bigger than 1 → pick the last
-  return activeLines[activeLines.length - 1];
+  // Ascending and deduplicated — ResolveToLeadIndex is monotonic over
+  // activeIndices, so only the previous entry needs checking.
+  const activeLeads: number[] = [];
+  for (const index of activeIndices) {
+    const lead = ResolveToLeadIndex(Lines, index);
+    if (IsBGLine(Lines[index]) && lead < frontLead) continue;
+    if (activeLeads[activeLeads.length - 1] !== lead) activeLeads.push(lead);
+  }
+
+  // The highest active line keeps the anchor as long as it (and its background
+  // lines) finish before the line PIN_LOOKAHEAD real lines further down starts.
+  const anchorIdx = activeLeads[0];
+  const lookahead = GetLookaheadLine(Lines, anchorIdx);
+  if (lookahead === null || GetGroupEndTime(Lines, anchorIdx) <= lookahead.StartTime) {
+    return enhance(anchorIdx);
+  }
+
+  // Anchor refused — fall back to the original heuristic: contiguous or off by
+  // only 1 → the first active line, a bigger gap → the last.
+  const firstIdx = activeLeads[0];
+  const lastIdx = activeLeads[activeLeads.length - 1];
+  return enhance(lastIdx - firstIdx <= 1 ? firstIdx : lastIdx);
 };
 
 const ScrollTo = (
   container: HTMLElement,
   element: HTMLElement,
   instantScroll: boolean = false,
-  type: "Center" | "Top" = "Center"
+  type: "Center" | "Top" = "Center",
+  lineIndex?: number
 ) => {
+  if (lineIndex !== undefined && getLyricsVirtualizer()) {
+    // instantScroll is effectively always true in the virtualizer path
+    // (we set scrollTop directly), but passing the flag keeps the intent
+    // explicit and allows a future smooth-scroll path if needed.
+    scrollLyricsToIndex(lineIndex, type === "Top" ? "start" : "center", instantScroll, type ==="Top" ? (IsPIP ? -50 : -85) : 30);
+    return;
+  }
   if (type === "Center") {
     ScrollIntoCenterViewCSS(container, element, -30, instantScroll);
   } else if (type === "Top") {
@@ -170,7 +243,6 @@ const GetScrollType = (): "Center" | "Top" => {
 const policyEventPreset = "policy:";
 
 let allowForceScrolling = true;
-let waitingForHeight = true;
 
 export const SetForceScrollingPolicy = (value: boolean) => {
   allowForceScrolling = value; // true = allow force scrolling, false = disallow force scrolling
@@ -180,20 +252,11 @@ export const GetForceScrollingPolicy = () => {
   return allowForceScrolling;
 };
 
-export const SetWaitingForHeight = (value: boolean) => {
-  waitingForHeight = value;
-  Global.Event.evoke(`${policyEventPreset}waiting-for-height`, value);
-};
-export const IsWaitingForHeight = () => {
-  return waitingForHeight;
-};
-
 export function ScrollToActiveLine(ScrollSimplebar: any) {
-  if (waitingForHeight) return;
-  if (Defaults.CurrentLyricsType === "Static" || Defaults.CurrentLyricsType === "None") return;
-  if (!Defaults.LyricsContainerExists) return;
+  if ($currentLyricsType.get() === "Static" || $currentLyricsType.get() === "None") return;
+  if (!$lyricsContainerExists.get()) return;
 
-  const currentType = Defaults.CurrentLyricsType as LyricsType;
+  const currentType = $currentLyricsType.get() as LyricsType;
   const Lines = LyricsObject.Types[currentType]?.Lines as LyricsLine[] | LyricsSyllable[];
   if (!Lines) return;
 
@@ -228,11 +291,13 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
       : currentLine?.HTMLElement;
     if (!scrollToLine) return;
     lastLine = scrollToLine;
+    const forceScrollLineIndex = allLinesSung ? Lines.length - 1 : currentLine?._LineIndex;
     ScrollTo(
       container,
       scrollToLine,
       shouldForceScroll || (lastPosition !== 0 && wasDrasticPositionChange(lastPosition ?? 0, Position)),
-      GetScrollType()
+      GetScrollType(),
+      forceScrollLineIndex
     );
     if (forceScrollQueued) {
       forceScrollQueued = false; // Reset the queue after using it
@@ -253,7 +318,8 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
       : currentLine?.HTMLElement;
     if (!scrollToLine) return;
     lastLine = scrollToLine;
-    ScrollTo(container, scrollToLine, false, GetScrollType());
+    const smoothScrollLineIndex = allLinesSung ? Lines.length - 1 : currentLine?._LineIndex;
+    ScrollTo(container, scrollToLine, false, GetScrollType(), smoothScrollLineIndex);
     if (smoothForceScrollQueued) {
       smoothForceScrollQueued = false; // Reset the queue after using it
     }
@@ -369,7 +435,13 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
         lastViewportContainer = container;
       }
 
-      const isLineInViewport = lastIsLineInViewport;
+      // When virtualizer is active, detached (off-screen) elements have offsetTop=0,
+      // making the standard viewport check unreliable. Use isConnected as a proxy:
+      // mounted elements are near the current scroll position (within overscan), so
+      // treating them as "in viewport" is close enough. Detached elements mean the
+      // user scrolled far away — preserve the original no-scroll behavior.
+      const isLineInViewport =
+        lastIsLineInViewport || (getLyricsVirtualizer() !== null && LineElem.isConnected);
 
       const isSameLine = lastLine === LineElem;
 
@@ -424,7 +496,7 @@ export function ScrollToActiveLine(ScrollSimplebar: any) {
         if (!isSameLine) {
           lastLine = LineElem;
           const Scroll = () => {
-            ScrollTo(container, LineElem, false, GetScrollType());
+            ScrollTo(container, LineElem, false, GetScrollType(), currentLine._LineIndex);
             scrolledToLastLine = false;
             scrolledToFirstLine = false;
           };

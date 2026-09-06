@@ -1,13 +1,12 @@
-import Defaults from "../../../../components/Global/Defaults.ts";
+import { $simpleLyricsMode } from "../../../../utils/stores.ts";
 import { ArabicPersianRegex } from "../../../Addons.ts";
-import storage from "../../../storage.ts";
 import { IdleEmphasisLyricsScale } from "../../Animator/Shared.ts";
 import { ConvertTime } from "../../ConvertTime.ts";
 import { CurrentLineLyricsObject, LyricsObject } from "../../lyrics.ts";
 
 const Substractions = {
-  StartTime: storage.get("simpleLyricsMode") === "true" ? -21 : 0,
-  EndTime: storage.get("simpleLyricsMode") === "true" ? -40 : 250,
+  StartTime: $simpleLyricsMode.get() ? -21 : 0,
+  EndTime: $simpleLyricsMode.get() ? -40 : 250,
 };
 
 interface LetterData {
@@ -37,6 +36,11 @@ export default function Emphasize(
     letterElem.textContent = letter;
     letterElem.classList.add("letter");
     letterElem.classList.add("Emphasis");
+    // Whitespace inside an inline-block collapses to a 0px box, which glues
+    // multi-word syllables ("Watch this") together. Tag it so CSS can size it.
+    if (letter.trim().length === 0) {
+      letterElem.classList.add("SpaceLetter");
+    }
     const isLastLetter = index === letters.length - 1;
     // Calculate start and end time for each letter
     const letterStartTime = StartTime + index * letterDuration;
@@ -68,7 +72,7 @@ export default function Emphasize(
       ...mcont,
     });
 
-    if (!Defaults.SimpleLyricsMode) {
+    if (!$simpleLyricsMode.get()) {
       letterElem.style.setProperty("--gradient-position", `-20%`);
     }
     letterElem.style.setProperty("--text-shadow-opacity", `0%`);

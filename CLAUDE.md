@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Commands
 
 ```bash
@@ -21,57 +19,38 @@ bun run lint:fix
 bun run fmt
 ```
 
-Build outputs: `dist/` (intermediate), `builds/spicy-lyrics.mjs` (final bundle consumed by Spicetify).
-
-Version and project name are managed in `project/config.ts` — bump this file when releasing.
-
-`isDev` flag in `src/components/Global/Defaults.ts` switches the API base URL between `http://localhost:3000` and `https://api.spicylyrics.org`.
-
 ## Architecture
 
 This is a **Spicetify extension** (not a standalone web app). It runs inside the Spotify desktop client and depends on `window.Spicetify.*` globals being available at runtime. The build tool is `@spicemod/creator` (spicetify-creator), configured in `spice.config.ts`.
 
-### Startup flow
+## Experiments
 
-`src/app.tsx` is the entry point. It waits for `Platform.OnSpotifyReady` (a promise that polls for `Spicetify.Platform` and `Spicetify.CosmosAsync`), then bootstraps the UI and registers event listeners for track changes.
+User-facing feature flags, shown in Settings → Experiments. Use one whenever a change alters existing behaviour enough that someone might want the old way back.
 
-### Core subsystems
+**Adding one:** append an entry to `EXPERIMENTS` in `src/utils/experiments.ts`. That is the entire registration — the persisted store, the settings row, and the search integration are all derived from it. Do not add anything to `stores.ts`, the settings panel, or the migration list.
 
-**Lyrics pipeline** (`src/utils/Lyrics/`)
-1. `fetchLyrics.ts` — fetches lyrics for a track URI; checks in-memory state → `LyricsStore` (IndexedDB-backed expire cache via `@spikerko/tools/Cache`) → network (`/query` API). Returns `[descriptor, httpStatus]` tuples.
-2. `ProcessLyrics.ts` — language detection (`franc`) + romanization for Japanese/Chinese/Korean/Cyrillic/Greek scripts.
-3. `Global/Applyer.ts` — dispatches to the three apply functions based on `lyrics.Type`.
-4. `Applyer/Static.ts`, `Applyer/Synced/Line.ts`, `Applyer/Synced/Syllable.ts` — build DOM for each lyrics type.
-5. `Animator/` — handles live playback animation (active line highlighting, scrolling).
+```ts
+{
+  id: "myExperiment",            // stable; persisted as "experiment:myExperiment"
+  label: "My Experiment",
+  description: "What it changes, and what turning it off restores.",
+  default: true,
+  pageClass: "Exp_MyExperiment", // optional
+  rebuildsNowBar: true,          // optional
+}
+```
 
-**Lyrics types** (from the API):
-- `"Static"` — plain line-by-line, no timing.
-- `"Line"` — line-synced with timestamps.
-- `"Syllable"` — word/syllable-level timing, supports Lead + Background vocal groups, RTL, romanization overlays.
+**Implementing one — prefer CSS.** Set `pageClass` and the class is kept in sync on `#SpicyLyricsPage`; write the new look under `#SpicyLyricsPage.Exp_Foo` and the old under `#SpicyLyricsPage:not(.Exp_Foo)`. Toggling is then free and needs no JS.
 
-**State / storage** (`src/utils/storage.ts`)
-Two hot keys (`currentlyFetching`, `currentLyricsData`) are kept in module-level variables for perf; everything else is stored in `Spicetify.LocalStorage` under the `SpicyLyrics-` prefix.
+Only when the *markup* differs (CSS alone can't get you there) read the flag in TS:
 
-**Global singleton** (`src/components/Global/Global.ts`)
-Thin wrapper around `window._spicy_lyrics` for cross-module scope sharing and a custom event bus (`EventManager`).
+```ts
+import { isExperimentEnabled } from "../../utils/experiments.ts";
+const enabled = isExperimentEnabled("myExperiment"); // id is type-checked
+```
 
-**Dynamic background** (`src/components/DynamicBG/`)
-Uses `@kawarp/core` (WebGL canvas warping) to render album art as an animated background. Artist header images are fetched separately and cached.
+Read it once at build time and set `rebuildsNowBar: true` so the fullscreen overlay is torn down and rebuilt when the flag flips — otherwise the toggle won't take effect until the view is reopened. In React, use `useStore($experiment("myExperiment"))`.
 
-**Settings** (`src/utils/settings.ts`)
-Uses a vendored/edited `spcr-settings` package (`src/edited_packages/spcr-settings/`) to register Spicetify Profiles settings sections.
+**Rules:** `id` is permanent once shipped (it is the storage key). Both states must work — "off" restores the previous behaviour in full, not an approximation. `default: true` for a change you intend to become the norm; `false` for genuinely unfinished work.
 
-**CLI sync** (`src/components/cli-sync/`)
-An in-development feature (currently commented out in `app.tsx`) for socket.io-based communication with a local CLI tool on port `29858`.
-
-### Key globals / types
-
-- `Spicetify` — the Spotify client API, typed in `src/types/spicetify.d.ts`.
-- `window._spicy_lyrics` — extension's own global scope, managed through `Global.SetScope` / `Global.GetScope`.
-- The `PageContainer` DOM element (from `src/components/Pages/PageView.ts`) is the root mount point for lyrics rendering.
-
-### Package notes
-
-- `@spikerko/tools` and `@spikerko/web-modules` are JSR packages aliased via npm.
-- Dynamic packages (`pinyin`, `aromanize`, `GreekRomanization`) are loaded at runtime via `src/utils/ImportPackage.ts` and cached in `src/packages/`.
-- TypeScript is strict-null-checks **off** — `null`/`undefined` checks are done manually throughout.
+`src/utils/experiments.ts` has the full contract in its header comment. `newProgressBarStyling` (the glass progress/volume bars) is the reference implementation — a pure `pageClass` switch, with both skins living side by side in `ContentBox.css`.
